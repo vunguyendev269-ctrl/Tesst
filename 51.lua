@@ -1,4 +1,4 @@
--- MYSTERIOUS FORCE - DIRECT SELECT OPTION1
+-- MYSTERIOUS FORCE - DIRECT REAL OPTION1 V2
 -- ============================================================
 -- Flow:
 --   1) Tween near Mysterious Force @ 150 studs/s
@@ -513,151 +513,216 @@ local function isOptionObject(tbl)
         and type(fn) == "function"
 end
 
+local function unwrapOption(v)
+    if isOptionObject(v) then
+        return v
+    end
+
+    if type(v) == "table" then
+        local inner = rawget(v, "option")
+
+        if isOptionObject(inner) then
+            return inner
+        end
+    end
+
+    return nil
+end
+
+local function candidateScore(path, opt, key)
+    local p = string.lower(
+        tostring(path or "")
+    )
+
+    if string.find(p, "_cancel", 1, true)
+        or string.find(p, ".cancel", 1, true)
+    then
+        return -100000
+    end
+
+    local score = 0
+
+    if string.find(p, "_options", 1, true) then
+        score += 1000
+    end
+
+    if string.find(p, "option1", 1, true) then
+        score += 900
+    end
+
+    if tostring(key) == "1"
+        or string.lower(tostring(key)) == "option1"
+    then
+        score += 800
+    end
+
+    local txt =
+        string.lower(
+            optionText(opt)
+        )
+
+    if string.find(txt, "use it", 1, true) then
+        score += 2000
+    end
+
+    return score
+end
+
 local function findOption1Object(active)
     if type(active) ~= "table" then
         return nil,nil
     end
 
-    local directPaths = {}
+    local best = nil
+    local bestPath = nil
+    local bestScore = -math.huge
+    local seen = {}
 
-    pcall(function()
-        if type(active._window) == "table"
-            and type(active._window._options)
-                == "table"
-        then
-            directPaths[#directPaths+1] = {
-                list=active._window._options,
-                path="active._window._options",
-            }
-        end
-    end)
+    local function consider(value, path, key)
+        local opt =
+            unwrapOption(value)
 
-    pcall(function()
-        if type(active._options) == "table" then
-            directPaths[#directPaths+1] = {
-                list=active._options,
-                path="active._options",
-            }
-        end
-    end)
-
-    for _,info in ipairs(directPaths) do
-        local list = info.list
-
-        local opt1 = rawget(list, 1)
-
-        if isOptionObject(opt1) then
-            return opt1,
-                info.path.."[1]"
+        if not opt then
+            return
         end
 
-        for _,key in ipairs({
-            "Option1",
-            "option1",
-            "1",
-        }) do
-            local opt =
-                rawget(list, key)
+        local score =
+            candidateScore(
+                path,
+                opt,
+                key
+            )
 
-            if isOptionObject(opt) then
-                return opt,
-                    info.path
-                    .."["
-                    ..tostring(key)
-                    .."]"
-            end
+        log(
+            "OPTION CANDIDATE",
+            "score="..tostring(score),
+            "path="..tostring(path),
+            "key="..tostring(key),
+            "text="..optionText(opt),
+            "obj="..tostring(opt)
+        )
+
+        if score > bestScore then
+            bestScore = score
+            best = opt
+            bestPath = path
         end
+    end
 
-        for k,opt in pairs(list) do
-            if isOptionObject(opt) then
-                local txt =
-                    string.lower(
-                        optionText(opt)
-                    )
+    -- Strongest path seen in current runtime:
+    -- active._pageStack.<page>._options.<option>
+    local pageStack =
+        rawget(active, "_pageStack")
 
-                if string.find(
-                    txt,
-                    "use it",
-                    1,
-                    true
-                ) then
-                    return opt,
-                        info.path
-                        .."["
-                        ..tostring(k)
-                        .."]"
+    if type(pageStack) == "table" then
+        for pageIndex,page in pairs(pageStack) do
+            if type(page) == "table" then
+                local options =
+                    rawget(page, "_options")
+
+                if type(options) == "table" then
+                    for k,v in pairs(options) do
+                        consider(
+                            v,
+                            "active._pageStack."
+                            ..tostring(pageIndex)
+                            .."._options."
+                            ..tostring(k),
+                            k
+                        )
+                    end
                 end
             end
         end
     end
 
-    local seen = {}
-    local first = nil
-    local firstPath = nil
-    local exact = nil
-    local exactPath = nil
+    local window =
+        rawget(active, "_window")
 
+    if type(window) == "table" then
+        local options =
+            rawget(window, "_options")
+
+        if type(options) == "table" then
+            for k,v in pairs(options) do
+                consider(
+                    v,
+                    "active._window._options."
+                    ..tostring(k),
+                    k
+                )
+            end
+        end
+    end
+
+    local directOptions =
+        rawget(active, "_options")
+
+    if type(directOptions) == "table" then
+        for k,v in pairs(directOptions) do
+            consider(
+                v,
+                "active._options."
+                ..tostring(k),
+                k
+            )
+        end
+    end
+
+    -- Recursive fallback.
+    -- Important: cancel paths are scored out and can never win.
     local function walk(tbl, depth, path)
-        if exact
-            or type(tbl) ~= "table"
+        if type(tbl) ~= "table"
             or seen[tbl]
-            or depth > 7
+            or depth > 8
         then
             return
         end
 
         seen[tbl] = true
 
-        if isOptionObject(tbl) then
-            first = first or tbl
-            firstPath = firstPath or path
-
-            local txt =
-                string.lower(
-                    optionText(tbl)
-                )
-
-            local lp =
-                string.lower(path)
-
-            if string.find(
-                txt,
-                "use it",
-                1,
-                true
-            )
-                or string.find(
-                    lp,
-                    "option1",
-                    1,
-                    true
-                )
-            then
-                exact = tbl
-                exactPath = path
-                return
-            end
-        end
-
         for k,v in pairs(tbl) do
+            local childPath =
+                path
+                .."."
+                ..tostring(k)
+
+            consider(
+                v,
+                childPath,
+                k
+            )
+
             if type(v) == "table" then
                 walk(
                     v,
                     depth+1,
-                    path.."."..tostring(k)
+                    childPath
                 )
-
-                if exact then
-                    return
-                end
             end
         end
     end
 
-    walk(active,0,"active")
+    walk(
+        active,
+        0,
+        "active"
+    )
 
-    return exact or first,
-        exactPath or firstPath
+    if best
+        and bestScore > -1000
+    then
+        log(
+            "OPTION PICKED",
+            "score="..tostring(bestScore),
+            "path="..tostring(bestPath),
+            "text="..optionText(best)
+        )
+
+        return best,bestPath
+    end
+
+    return nil,nil
 end
 
 local function selectOption1(option)
@@ -672,38 +737,21 @@ local function selectOption1(option)
         )
     )
 
-    -- IMPORTANT: self first.
-    local okSelf, retSelf =
-        pcall(
-            DialogueController.select,
-            DialogueController,
-            option
-        )
-
-    log(
-        "SELECT SELF",
-        "ok="..tostring(okSelf),
-        "ret="..tostring(retSelf)
-    )
-
-    if okSelf then
-        return true,
-            "DialogueController:select(option)"
-    end
-
-    local okNoSelf, retNoSelf =
+    -- Runtime log proved selectArity=1.
+    -- Correct API call: select(option), not select(self, option).
+    local ok, ret =
         pcall(
             DialogueController.select,
             option
         )
 
     log(
-        "SELECT NOSELF",
-        "ok="..tostring(okNoSelf),
-        "ret="..tostring(retNoSelf)
+        "SELECT OPTION1",
+        "ok="..tostring(ok),
+        "ret="..tostring(ret)
     )
 
-    if okNoSelf then
+    if ok then
         return true,
             "DialogueController.select(option)"
     end
@@ -734,7 +782,7 @@ local function selectOption1(option)
     end
 
     return false,
-        "all select paths failed"
+        tostring(ret)
 end
 
 local function waitTeleport(before, timeout)
@@ -1047,7 +1095,7 @@ Header.TextSize = 14
 Header.TextColor3 = Color3.new(1,1,1)
 Header.TextXAlignment = Enum.TextXAlignment.Left
 Header.Text =
-    "MYSTERIOUS FORCE - DIRECT SELECT OPTION1"
+    "MYSTERIOUS FORCE - DIRECT REAL OPTION1 V2"
 Header.Active = true
 Header.Parent = Panel
 
@@ -1212,7 +1260,7 @@ end)
 log(
     "READY",
     "Direct option select",
-    "self-first",
+    "cancel-filtered",
     "Tween=150"
 )
 
