@@ -1,5 +1,5 @@
 --[[
-    MYSTERIOUS FORCE - FULL FLOW DEBUGGER V5
+    MYSTERIOUS FORCE - FULL FLOW DEBUGGER V6
     =========================================
     Flow chuẩn:
         ARM FULL FLOW
@@ -38,7 +38,7 @@ local UIS = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 if not LP then
-    warn("[MF FLOW V5] LocalPlayer missing")
+    warn("[MF FLOW V6] LocalPlayer missing")
     return
 end
 
@@ -73,6 +73,9 @@ local State = {
     sawTeleport = false,
     checkAt = nil,
     teleportAt = nil,
+
+    checkReturn = nil,
+    teleportReturn = nil,
 }
 
 local oldNamecall = nil
@@ -253,6 +256,44 @@ local function argsToLua(args)
     return table.concat(out, ", ")
 end
 
+local function returnsToLua(results)
+    if not results then
+        return "<not captured>"
+    end
+
+    if (results.n or 0) == 0 then
+        return "<no return values>"
+    end
+
+    local out = {}
+
+    for i = 1, results.n do
+        out[#out+1] =
+            valueToLua(results[i])
+    end
+
+    return table.concat(out, ", ")
+end
+
+local function returnsTypeText(results)
+    if not results then
+        return "not-captured"
+    end
+
+    if (results.n or 0) == 0 then
+        return "none"
+    end
+
+    local out = {}
+
+    for i = 1, results.n do
+        out[#out+1] =
+            typeof(results[i])
+    end
+
+    return table.concat(out, ", ")
+end
+
 -- ============================================================
 -- UI LOG
 -- ============================================================
@@ -308,7 +349,7 @@ local function uiLog(tag, msg, autoScroll)
         table.remove(uiLines, 1)
     end
 
-    print("[MF FLOW V5] " .. line)
+    print("[MF FLOW V6] " .. line)
 
     refreshUi()
 
@@ -410,6 +451,29 @@ local function buildSummary(records, startedAt, endedAt)
                 .. makeCommand(item)
 
             lines[#lines+1] =
+                "RETURN: "
+                .. returnsToLua(
+                    item.returns
+                )
+
+            lines[#lines+1] =
+                "RETURN_TYPE: "
+                .. returnsTypeText(
+                    item.returns
+                )
+
+            lines[#lines+1] =
+                "REMOTE_TIME: "
+                .. (
+                    item.duration
+                    and string.format(
+                        "%.6fs",
+                        item.duration
+                    )
+                    or "n/a"
+                )
+
+            lines[#lines+1] =
                 "CALLER: "
                 .. (
                     item.caller
@@ -482,6 +546,33 @@ local function buildFullOutput(records, startedAt, endedAt)
         lines[#lines+1] =
             "METHOD: "
             .. tostring(item.method)
+
+        if item.method == "InvokeServer"
+            or item.method == "Invoke"
+        then
+            lines[#lines+1] =
+                "RETURN: "
+                .. returnsToLua(
+                    item.returns
+                )
+
+            lines[#lines+1] =
+                "RETURN_TYPE: "
+                .. returnsTypeText(
+                    item.returns
+                )
+
+            lines[#lines+1] =
+                "REMOTE_TIME: "
+                .. (
+                    item.duration
+                    and string.format(
+                        "%.6fs",
+                        item.duration
+                    )
+                    or "n/a"
+                )
+        end
 
         lines[#lines+1] =
             "CALLER: "
@@ -687,20 +778,62 @@ local function installHook()
                             end)
                         end
 
-                        -- Raw-only capture.
-                        rawCalls[
-                            #rawCalls + 1
-                        ] = {
+                        local callArgs =
+                            copyArgs(...)
+
+                        local record = {
                             time =
                                 os.clock(),
                             target = self,
                             method = method,
-                            args =
-                                copyArgs(...),
+                            args = callArgs,
                             caller = caller,
+                            returns = nil,
+                            duration = nil,
                         }
 
-                        -- Untouched passthrough.
+                        rawCalls[
+                            #rawCalls + 1
+                        ] = record
+
+                        -- For the two V4 progression calls only, preserve and
+                        -- record the real InvokeServer return value.
+                        --
+                        -- Other network/bindable calls stay on the light
+                        -- passthrough path to minimize interaction impact.
+                        local isV4Invoke =
+                            self == CommF
+                            and method == "InvokeServer"
+                            and callArgs[1]
+                                == "RaceV4Progress"
+
+                        if isV4Invoke then
+                            local invokeStarted =
+                                os.clock()
+
+                            local results =
+                                table.pack(
+                                    oldNamecall(
+                                        self,
+                                        ...
+                                    )
+                                )
+
+                            record.duration =
+                                os.clock()
+                                - invokeStarted
+
+                            record.returns =
+                                results
+
+                            return table.unpack(
+                                results,
+                                1,
+                                results.n
+                            )
+                        end
+
+                        -- Untouched passthrough for everything else.
                         return oldNamecall(
                             self,
                             ...
@@ -799,6 +932,8 @@ local function startFullCapture()
     State.sawTeleport = false
     State.checkAt = nil
     State.teleportAt = nil
+    State.checkReturn = nil
+    State.teleportReturn = nil
     State.menuOpen = false
 
     if not installHook() then
@@ -851,13 +986,43 @@ task.spawn(function()
                 )
                     and not State.sawCheck
                 then
+                    -- InvokeServer return may be written into the record
+                    -- immediately after the original remote returns.
+                    local waitDeadline =
+                        os.clock() + 2
+
+                    while item.returns == nil
+                        and os.clock()
+                            < waitDeadline
+                    do
+                        task.wait()
+                    end
+
                     State.sawCheck = true
                     State.checkAt =
                         item.time
+                    State.checkReturn =
+                        item.returns
 
                     uiLog(
                         "FLOW",
-                        "RaceV4Progress Check captured"
+                        "CHECK RETURN = "
+                        .. returnsToLua(
+                            item.returns
+                        )
+                        .. " | TYPE="
+                        .. returnsTypeText(
+                            item.returns
+                        )
+                        .. " | dt="
+                        .. (
+                            item.duration
+                            and string.format(
+                                "%.4fs",
+                                item.duration
+                            )
+                            or "n/a"
+                        )
                     )
                 end
 
@@ -867,13 +1032,41 @@ task.spawn(function()
                 )
                     and not State.sawTeleport
                 then
+                    local waitDeadline =
+                        os.clock() + 2
+
+                    while item.returns == nil
+                        and os.clock()
+                            < waitDeadline
+                    do
+                        task.wait()
+                    end
+
                     State.sawTeleport = true
                     State.teleportAt =
                         item.time
+                    State.teleportReturn =
+                        item.returns
 
                     uiLog(
                         "FLOW",
-                        "RaceV4Progress Teleport captured"
+                        "TELEPORT RETURN = "
+                        .. returnsToLua(
+                            item.returns
+                        )
+                        .. " | TYPE="
+                        .. returnsTypeText(
+                            item.returns
+                        )
+                        .. " | dt="
+                        .. (
+                            item.duration
+                            and string.format(
+                                "%.4fs",
+                                item.duration
+                            )
+                            or "n/a"
+                        )
                     )
                 end
             end
@@ -1005,7 +1198,7 @@ end)
 
 local old =
     parent:FindFirstChild(
-        "MFFullFlowDebuggerV5"
+        "MFFullFlowDebuggerV6"
     )
 
 if old then
@@ -1016,7 +1209,7 @@ local Gui =
     Instance.new("ScreenGui")
 
 Gui.Name =
-    "MFFullFlowDebuggerV5"
+    "MFFullFlowDebuggerV6"
 
 Gui.ResetOnSpawn = false
 Gui.Parent = parent
@@ -1088,7 +1281,7 @@ Header.TextXAlignment =
     Enum.TextXAlignment.Left
 
 Header.Text =
-    "MYSTERIOUS FORCE - FULL FLOW DEBUGGER V5"
+    "MYSTERIOUS FORCE - FULL FLOW DEBUGGER V6"
 
 Header.Active = true
 Header.Parent = Frame
@@ -1544,6 +1737,11 @@ uiLog(
 uiLog(
     "OUTPUT",
     "Completed capture writes workspace/service.txt"
+)
+
+uiLog(
+    "RETURN",
+    "V6 records real Check/Teleport InvokeServer return values."
 )
 
 uiLog(
