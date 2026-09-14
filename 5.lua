@@ -1,20 +1,16 @@
--- MYSTERIOUS FORCE - CONCURRENT START + AUTO USE IT
+-- MYSTERIOUS FORCE - DIRECT SELECT OPTION1
 -- ============================================================
--- Root-cause fix:
--- DialogueController.start(...) yields until the dialogue ends.
--- Therefore start() MUST run in a separate task, while the main
--- task watches DialogueGui and clicks Option1 / "Use it".
---
 -- Flow:
 --   1) Tween near Mysterious Force @ 150 studs/s
---   2) Stay there (NO restore)
---   3) task.spawn(DialogueController.start(...))
---   4) Concurrently detect real option1/button in DialogueGui
---   5) Real VIM click Use it
---   6) Detect server teleport to Temple
---   7) Auto-close "The space tears open..." result dialogue
+--   2) Spawn DialogueController.start(...) because start() yields
+--   3) Wait until GUI option1 exists (means options are ready)
+--   4) Get active dialogue
+--   5) Find REAL Option1 object
+--   6) Call DialogueController.select(DialogueController, option1)
+--   7) Wait Temple teleport
+--   8) Auto-close result dialogue
 --
--- No network hook.
+-- No network hooks.
 -- No direct InvokeServer / FireServer.
 
 if not game:IsLoaded() then
@@ -24,7 +20,6 @@ end
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
-local VIM = game:GetService("VirtualInputManager")
 local CoreGui = game:GetService("CoreGui")
 local UIS = game:GetService("UserInputService")
 
@@ -61,7 +56,6 @@ local logs = {}
 local LogLabel
 local Scroll
 local StatusLabel
-
 local busy = false
 local cachedNPC = nil
 
@@ -86,7 +80,7 @@ local function log(...)
         table.remove(logs, 1)
     end
 
-    print("[MF CONCURRENT]", line)
+    print("[MF DIRECT SELECT]", line)
 
     if LogLabel then
         LogLabel.Text =
@@ -114,6 +108,7 @@ local function setStatus(text, running)
     end
 
     StatusLabel.Text = text
+
     StatusLabel.TextColor3 =
         running
         and Color3.fromRGB(80,255,150)
@@ -159,9 +154,29 @@ local function safeFullName(inst)
     return ok and result or tostring(inst)
 end
 
--- ============================================================
--- NPC
--- ============================================================
+local function arity(fn)
+    if type(fn) ~= "function" then
+        return "not-function"
+    end
+
+    if type(debug) == "table"
+        and type(debug.info) == "function"
+    then
+        local ok,a,b =
+            pcall(function()
+                return debug.info(fn, "a")
+            end)
+
+        if ok then
+            return tostring(a)
+                .. ",vararg="
+                .. tostring(b)
+        end
+    end
+
+    return "unknown"
+end
+
 local function getNpcWrapper()
     if cachedNPC then
         return cachedNPC
@@ -262,9 +277,6 @@ local function getNpcRoot(npc)
     end
 end
 
--- ============================================================
--- MOVEMENT
--- ============================================================
 local function tweenNearNpc(npcRoot)
     local hrp = getHRP()
 
@@ -286,7 +298,6 @@ local function tweenNearNpc(npcRoot)
     if dist <= ARRIVE_DISTANCE then
         hrp.CFrame = target
         stopVelocity(hrp)
-
         return true, dist
     end
 
@@ -340,50 +351,29 @@ local function tweenNearNpc(npcRoot)
 
         if d <= ARRIVE_DISTANCE then
             tween:Cancel()
-
             hrp.CFrame = target
             stopVelocity(hrp)
-
             return true, d
         end
     end
 
     tween:Cancel()
-
     return false, "move timeout"
 end
 
--- ============================================================
--- DIALOGUE / OPTION1 GUI
--- ============================================================
 local function getDialogueGui()
     return PlayerGui:FindFirstChild(
         "DialogueGui"
     )
 end
 
-local function safeClose()
-    pcall(function()
-        DialogueController.close()
-    end)
-
-    task.wait(0.08)
-end
-
-local function findOption1Button()
+local function findGuiOption1()
     local dg = getDialogueGui()
 
     if not dg then
-        return nil,nil,nil
+        return nil
     end
 
-    -- Preferred exact structure discovered at runtime:
-    -- DialogueGui
-    --   dynamic root
-    --     optionsList
-    --       scroller
-    --         dynamic "...:option1"
-    --           button
     for _,root in ipairs(dg:GetChildren()) do
         local options =
             root:FindFirstChild(
@@ -400,13 +390,13 @@ local function findOption1Button()
             for _,container in ipairs(
                 scroller:GetChildren()
             ) do
-                local n =
+                local name =
                     string.lower(
                         tostring(container.Name)
                     )
 
                 if string.find(
-                    n,
+                    name,
                     "option1",
                     1,
                     true
@@ -424,7 +414,6 @@ local function findOption1Button()
                         pcall(function()
                             ready =
                                 button.Visible
-                                and button.Active
                                 and button.AbsoluteSize.X > 20
                                 and button.AbsoluteSize.Y > 20
                         end)
@@ -438,163 +427,314 @@ local function findOption1Button()
         end
     end
 
-    -- Fallback:
-    -- Find a visible GuiButton with "option1" somewhere
-    -- in its ancestor chain.
-    for _,obj in ipairs(dg:GetDescendants()) do
-        if obj:IsA("GuiButton") then
-            local ready = false
+    return nil
+end
 
+local function waitGuiOption1(timeout)
+    local deadline =
+        os.clock()
+        + (timeout or OPTION_WAIT)
+
+    while os.clock() < deadline do
+        local b,c,r =
+            findGuiOption1()
+
+        if b then
+            return b,c,r
+        end
+
+        task.wait(0.02)
+    end
+end
+
+local function getActiveDialogue()
+    local ok, active =
+        pcall(
+            DialogueController.getActiveDialogue
+        )
+
+    if ok
+        and type(active) == "table"
+    then
+        return active, "no-self"
+    end
+
+    local ok2, active2 =
+        pcall(
+            DialogueController.getActiveDialogue,
+            DialogueController
+        )
+
+    if ok2
+        and type(active2) == "table"
+    then
+        return active2, "self"
+    end
+
+    return nil, "failed"
+end
+
+local function optionText(opt)
+    if type(opt) ~= "table" then
+        return ""
+    end
+
+    for _,k in ipairs({
+        "_text",
+        "Text",
+        "text",
+        "Title",
+        "title",
+    }) do
+        local ok,v =
             pcall(function()
-                ready =
-                    obj.Visible
-                    and obj.Active
-                    and obj.AbsoluteSize.X > 20
-                    and obj.AbsoluteSize.Y > 20
+                return opt[k]
             end)
 
-            if ready then
-                local cur = obj
-                local signature = ""
+        if ok and type(v) == "string" then
+            return v
+        end
+    end
 
-                for _ = 1,8 do
-                    if not cur then
-                        break
-                    end
+    return ""
+end
 
-                    signature =
-                        signature
-                        .. "/"
-                        .. string.lower(
-                            tostring(cur.Name)
-                        )
+local function isOptionObject(tbl)
+    if type(tbl) ~= "table" then
+        return false
+    end
 
-                    if cur == dg then
-                        break
-                    end
+    local ok, fn =
+        pcall(function()
+            return tbl.onSelected
+        end)
 
-                    cur = cur.Parent
-                end
+    return ok
+        and type(fn) == "function"
+end
+
+local function findOption1Object(active)
+    if type(active) ~= "table" then
+        return nil,nil
+    end
+
+    local directPaths = {}
+
+    pcall(function()
+        if type(active._window) == "table"
+            and type(active._window._options)
+                == "table"
+        then
+            directPaths[#directPaths+1] = {
+                list=active._window._options,
+                path="active._window._options",
+            }
+        end
+    end)
+
+    pcall(function()
+        if type(active._options) == "table" then
+            directPaths[#directPaths+1] = {
+                list=active._options,
+                path="active._options",
+            }
+        end
+    end)
+
+    for _,info in ipairs(directPaths) do
+        local list = info.list
+
+        local opt1 = rawget(list, 1)
+
+        if isOptionObject(opt1) then
+            return opt1,
+                info.path.."[1]"
+        end
+
+        for _,key in ipairs({
+            "Option1",
+            "option1",
+            "1",
+        }) do
+            local opt =
+                rawget(list, key)
+
+            if isOptionObject(opt) then
+                return opt,
+                    info.path
+                    .."["
+                    ..tostring(key)
+                    .."]"
+            end
+        end
+
+        for k,opt in pairs(list) do
+            if isOptionObject(opt) then
+                local txt =
+                    string.lower(
+                        optionText(opt)
+                    )
 
                 if string.find(
-                    signature,
-                    "option1",
+                    txt,
+                    "use it",
                     1,
                     true
                 ) then
-                    return obj,obj.Parent,nil
+                    return opt,
+                        info.path
+                        .."["
+                        ..tostring(k)
+                        .."]"
                 end
             end
         end
     end
 
-    return nil,nil,nil
-end
+    local seen = {}
+    local first = nil
+    local firstPath = nil
+    local exact = nil
+    local exactPath = nil
 
-local function waitOption1(timeout)
-    local deadline =
-        os.clock()
-        + (timeout or OPTION_WAIT)
-
-    local lastLog = 0
-
-    while os.clock() < deadline do
-        local button,container,root =
-            findOption1Button()
-
-        if button then
-            return button,container,root
+    local function walk(tbl, depth, path)
+        if exact
+            or type(tbl) ~= "table"
+            or seen[tbl]
+            or depth > 7
+        then
+            return
         end
 
-        if os.clock()-lastLog > 0.5 then
-            lastLog = os.clock()
-            log(
-                "WAIT OPTION1",
-                string.format(
-                    "%.2fs",
-                    deadline-os.clock()
+        seen[tbl] = true
+
+        if isOptionObject(tbl) then
+            first = first or tbl
+            firstPath = firstPath or path
+
+            local txt =
+                string.lower(
+                    optionText(tbl)
                 )
+
+            local lp =
+                string.lower(path)
+
+            if string.find(
+                txt,
+                "use it",
+                1,
+                true
             )
+                or string.find(
+                    lp,
+                    "option1",
+                    1,
+                    true
+                )
+            then
+                exact = tbl
+                exactPath = path
+                return
+            end
         end
 
-        task.wait(0.02)
+        for k,v in pairs(tbl) do
+            if type(v) == "table" then
+                walk(
+                    v,
+                    depth+1,
+                    path.."."..tostring(k)
+                )
+
+                if exact then
+                    return
+                end
+            end
+        end
     end
 
-    return nil,nil,nil
+    walk(active,0,"active")
+
+    return exact or first,
+        exactPath or firstPath
 end
 
-local function realClick(button)
-    local pos = button.AbsolutePosition
-    local size = button.AbsoluteSize
-
-    local x = pos.X + size.X/2
-    local y = pos.Y + size.Y/2
+local function selectOption1(option)
+    if not option then
+        return false, "option=nil"
+    end
 
     log(
-        "REAL CLICK",
-        safeFullName(button),
-        string.format(
-            "center=(%.0f,%.0f) size=(%.0f,%.0f)",
-            x,
-            y,
-            size.X,
-            size.Y
+        "SELECT SIG",
+        arity(
+            DialogueController.select
         )
     )
 
-    VIM:SendMouseMoveEvent(
-        x,
-        y,
-        game
+    -- IMPORTANT: self first.
+    local okSelf, retSelf =
+        pcall(
+            DialogueController.select,
+            DialogueController,
+            option
+        )
+
+    log(
+        "SELECT SELF",
+        "ok="..tostring(okSelf),
+        "ret="..tostring(retSelf)
     )
 
-    task.wait(0.04)
-
-    VIM:SendMouseButtonEvent(
-        x,
-        y,
-        0,
-        true,
-        game,
-        0
-    )
-
-    task.wait(0.06)
-
-    VIM:SendMouseButtonEvent(
-        x,
-        y,
-        0,
-        false,
-        game,
-        0
-    )
-end
-
--- ============================================================
--- TELEPORT DETECTION
--- ============================================================
-local function hasTeleported(before)
-    local hrp = getHRP()
-
-    if not hrp
-        or not before
-    then
-        return false,nil,nil
+    if okSelf then
+        return true,
+            "DialogueController:select(option)"
     end
 
-    local jump =
-        (hrp.Position-before).Magnitude
+    local okNoSelf, retNoSelf =
+        pcall(
+            DialogueController.select,
+            option
+        )
 
-    local templeDist =
-        (hrp.Position-TEMPLE_POS).Magnitude
+    log(
+        "SELECT NOSELF",
+        "ok="..tostring(okNoSelf),
+        "ret="..tostring(retNoSelf)
+    )
 
-    return (
-        jump > JUMP_THRESHOLD
-        or templeDist < 500
-    ),
-    jump,
-    templeDist
+    if okNoSelf then
+        return true,
+            "DialogueController.select(option)"
+    end
+
+    local fn = nil
+
+    pcall(function()
+        fn = option.onSelected
+    end)
+
+    if type(fn) == "function" then
+        local okDirect, retDirect =
+            pcall(
+                fn,
+                option
+            )
+
+        log(
+            "OPTION onSelected",
+            "ok="..tostring(okDirect),
+            "ret="..tostring(retDirect)
+        )
+
+        if okDirect then
+            return true,
+                "option:onSelected()"
+        end
+    end
+
+    return false,
+        "all select paths failed"
 end
 
 local function waitTeleport(before, timeout)
@@ -605,40 +745,53 @@ local function waitTeleport(before, timeout)
     while os.clock() < deadline do
         task.wait(0.05)
 
-        local yes,jump,templeDist =
-            hasTeleported(before)
+        local hrp = getHRP()
 
-        if yes then
-            local hrp = getHRP()
+        if hrp and before then
+            local jump =
+                (hrp.Position-before).Magnitude
 
-            log(
-                "SERVER TELEPORT",
-                string.format(
-                    "jump=%.1f templeDist=%.1f pos=(%.1f,%.1f,%.1f)",
-                    jump or -1,
-                    templeDist or -1,
-                    hrp.Position.X,
-                    hrp.Position.Y,
-                    hrp.Position.Z
+            local templeDist =
+                (hrp.Position-TEMPLE_POS).Magnitude
+
+            if jump > JUMP_THRESHOLD
+                or templeDist < 500
+            then
+                log(
+                    "SERVER TELEPORT",
+                    string.format(
+                        "jump=%.1f templeDist=%.1f pos=(%.1f,%.1f,%.1f)",
+                        jump,
+                        templeDist,
+                        hrp.Position.X,
+                        hrp.Position.Y,
+                        hrp.Position.Z
+                    )
                 )
-            )
 
-            return true
+                return true
+            end
         end
     end
 
     return false
 end
 
-local function autoCloseResultDialogue()
-    -- Result dialogue:
-    -- "The space tears open, and you arrive in a new place."
+local function autoCloseResult()
     task.wait(0.30)
 
     local ok, err =
-        pcall(function()
-            DialogueController.close()
-        end)
+        pcall(
+            DialogueController.close,
+            DialogueController
+        )
+
+    if not ok then
+        ok, err =
+            pcall(
+                DialogueController.close
+            )
+    end
 
     log(
         "AUTO CLOSE RESULT",
@@ -647,9 +800,6 @@ local function autoCloseResultDialogue()
     )
 end
 
--- ============================================================
--- MAIN
--- ============================================================
 local function runFlow()
     if busy then
         log("BUSY")
@@ -685,13 +835,13 @@ local function runFlow()
                     safeFullName(npcRoot)
                 )
 
-                local moved,moveInfo =
+                local moved,info =
                     tweenNearNpc(npcRoot)
 
                 log(
                     "MOVE",
                     tostring(moved),
-                    tostring(moveInfo)
+                    tostring(info)
                 )
 
                 if not moved then
@@ -715,115 +865,108 @@ local function runFlow()
                     )
                 )
 
-                safeClose()
+                pcall(
+                    DialogueController.close
+                )
 
-                -- ====================================================
-                -- CRITICAL FIX:
-                -- start() yields. Run it in a SEPARATE task.
-                -- ====================================================
-                local startFinished = false
-                local startOk = nil
-                local startRet = nil
+                task.wait(0.08)
 
                 task.spawn(function()
-                    local ok, ret =
+                    local okStart, retStart =
                         pcall(
                             DialogueController.start,
                             TempleTeleport,
                             npc
                         )
 
-                    startOk = ok
-                    startRet = ret
-                    startFinished = true
-
                     log(
                         "START RETURN",
-                        "ok="..tostring(ok),
-                        "ret="..tostring(ret)
+                        "ok="..tostring(okStart),
+                        "ret="..tostring(retStart)
                     )
                 end)
 
                 log(
                     "START SPAWNED",
-                    "monitoring GUI concurrently"
+                    "waiting Option1 ready"
                 )
 
-                -- Main task continues immediately while
-                -- DialogueController.start is still yielded.
-                local button,container,root =
-                    waitOption1(
+                local guiButton =
+                    waitGuiOption1(
                         OPTION_WAIT
                     )
 
-                if not button then
-                    log(
-                        "START STATE",
-                        "finished="
-                        ..tostring(startFinished),
-                        "ok="
-                        ..tostring(startOk),
-                        "ret="
-                        ..tostring(startRet)
-                    )
-
+                if not guiButton then
                     error(
-                        "Option1 did not appear while dialogue was active"
+                        "GUI Option1 never appeared"
                     )
                 end
 
                 log(
-                    "OPTION1 DETECTED",
-                    "container="
-                    ..tostring(
-                        container
-                        and container.Name
-                    ),
-                    "button="
-                    ..safeFullName(button)
+                    "GUI OPTION1 READY",
+                    safeFullName(guiButton)
                 )
 
-                -- Tiny settle time after the actual button exists.
-                task.wait(0.08)
+                local active, activeMode =
+                    getActiveDialogue()
+
+                log(
+                    "ACTIVE",
+                    "mode="..tostring(activeMode),
+                    "type="..typeof(active)
+                )
+
+                if type(active) ~= "table" then
+                    error(
+                        "active dialogue missing"
+                    )
+                end
+
+                local option1,path =
+                    findOption1Object(active)
+
+                log(
+                    "OPTION1 OBJECT",
+                    "obj="..tostring(option1),
+                    "path="..tostring(path),
+                    "text="..optionText(option1)
+                )
+
+                if not option1 then
+                    error(
+                        "real Option1 object not found"
+                    )
+                end
 
                 hrp = getHRP()
+
                 local before =
-                    hrp
-                    and hrp.Position
+                    hrp and hrp.Position
 
-                realClick(button)
+                local selected, method =
+                    selectOption1(option1)
 
-                -- First teleport window.
+                log(
+                    "SELECT RESULT",
+                    tostring(selected),
+                    tostring(method)
+                )
+
+                if not selected then
+                    error(
+                        "Option1 direct select failed"
+                    )
+                end
+
                 local teleported =
                     waitTeleport(
                         before,
-                        1.25
+                        TELEPORT_WAIT
                     )
-
-                -- If first physical click was swallowed, retry once.
-                if not teleported then
-                    local retry =
-                        findOption1Button()
-
-                    if retry then
-                        log(
-                            "RETRY",
-                            "Option1 still visible -> click again"
-                        )
-
-                        realClick(retry)
-
-                        teleported =
-                            waitTeleport(
-                                before,
-                                TELEPORT_WAIT
-                            )
-                    end
-                end
 
                 if not teleported then
                     error(
-                        "Use it click sent, but no Temple teleport"
+                        "Option1 selected but no Temple teleport"
                     )
                 end
 
@@ -832,12 +975,11 @@ local function runFlow()
                     "Temple entered"
                 )
 
-                -- Stay in Temple; never restore old position.
-                autoCloseResultDialogue()
+                autoCloseResult()
 
                 log(
                     "DONE",
-                    "post-teleport result dialogue closed"
+                    "result dialogue closed"
                 )
             end)
 
@@ -849,7 +991,7 @@ local function runFlow()
 
             log(
                 "HOLD POSITION",
-                "no restore; player remains at NPC"
+                "player remains near NPC"
             )
         end
 
@@ -858,9 +1000,6 @@ local function runFlow()
     end)
 end
 
--- ============================================================
--- DEBUG UI
--- ============================================================
 local parent = CoreGui
 
 pcall(function()
@@ -875,7 +1014,7 @@ end)
 
 local old =
     parent:FindFirstChild(
-        "MFConcurrentUseItDebug"
+        "MFDirectSelectOption1"
     )
 
 if old then
@@ -883,13 +1022,13 @@ if old then
 end
 
 local Gui = Instance.new("ScreenGui")
-Gui.Name = "MFConcurrentUseItDebug"
+Gui.Name = "MFDirectSelectOption1"
 Gui.ResetOnSpawn = false
 Gui.Parent = parent
 
 local Panel = Instance.new("Frame")
-Panel.Size = UDim2.fromOffset(850,500)
-Panel.Position = UDim2.new(0.5,-425,0.5,-250)
+Panel.Size = UDim2.fromOffset(860,510)
+Panel.Position = UDim2.new(0.5,-430,0.5,-255)
 Panel.BackgroundColor3 = Color3.fromRGB(18,21,29)
 Panel.BorderSizePixel = 0
 Panel.Active = true
@@ -908,7 +1047,7 @@ Header.TextSize = 14
 Header.TextColor3 = Color3.new(1,1,1)
 Header.TextXAlignment = Enum.TextXAlignment.Left
 Header.Text =
-    "MYSTERIOUS FORCE - CONCURRENT START + AUTO USE IT"
+    "MYSTERIOUS FORCE - DIRECT SELECT OPTION1"
 Header.Active = true
 Header.Parent = Panel
 
@@ -977,7 +1116,7 @@ local function makeButton(
 end
 
 makeButton(
-    "1 CLICK:\nNEAR NPC -> AUTO USE IT -> TEMPLE",
+    "1 CLICK:\nNEAR NPC -> DIRECT SELECT OPTION1",
     0,
     0.55,
     runFlow
@@ -990,7 +1129,7 @@ makeButton(
     0.225,
     function()
         if type(setclipboard) == "function" then
-            local ok, err =
+            local ok,err =
                 pcall(function()
                     setclipboard(
                         table.concat(
@@ -1009,39 +1148,28 @@ makeButton(
 )
 
 makeButton(
-    "CHECK OPTION1",
+    "INSPECT OPTION1",
     0.775,
     0.225,
     function()
-        local b,c,r =
-            findOption1Button()
+        local active,mode =
+            getActiveDialogue()
+
+        local opt,path =
+            findOption1Object(active)
 
         log(
-            "CHECK OPTION1",
-            "button="..tostring(b),
-            "container="
-            ..tostring(c and c.Name),
-            "root="
-            ..tostring(r and r.Name)
+            "INSPECT",
+            "activeMode="..tostring(mode),
+            "option="..tostring(opt),
+            "path="..tostring(path),
+            "text="..optionText(opt),
+            "selectArity="
+            ..arity(DialogueController.select)
         )
-
-        if b then
-            log(
-                "BUTTON PATH",
-                safeFullName(b),
-                string.format(
-                    "pos=(%.0f,%.0f) size=(%.0f,%.0f)",
-                    b.AbsolutePosition.X,
-                    b.AbsolutePosition.Y,
-                    b.AbsoluteSize.X,
-                    b.AbsoluteSize.Y
-                )
-            )
-        end
     end
 )
 
--- draggable
 local dragging = false
 local dragStart
 local startPos
@@ -1083,7 +1211,14 @@ end)
 
 log(
     "READY",
-    "Root fix=start() in separate task",
-    "TweenSpeed=150",
-    "No restore on failure"
+    "Direct option select",
+    "self-first",
+    "Tween=150"
+)
+
+log(
+    "SELECT ARITY",
+    arity(
+        DialogueController.select
+    )
 )
