@@ -89,9 +89,10 @@ local function getObjectPosition(obj)
 end
 
 local function horizontalDistance(a,b)
-    return Vector2.new(a.X,a.Z)
-        :sub(Vector2.new(b.X,b.Z))
-        .Magnitude
+    return (
+        Vector2.new(a.X, a.Z)
+        - Vector2.new(b.X, b.Z)
+    ).Magnitude
 end
 
 -- Scan the game's real PlayerSpawns and pick the one nearest Great Tree.
